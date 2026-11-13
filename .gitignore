@@ -1,0 +1,30 @@
+# Local files and environments
+.DS_Store
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+CONTRIBUTING.md
+
+# Python caches and build artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# Data, weights, and generated outputs
+/data/
+/models/
+/outputs/
+/checkpoints/
+/results/
+/logs/
+/tensorboard/
+*.log
+*.safetensors
+*.ckpt
+*.pt
+*.pth

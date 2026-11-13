@@ -1,0 +1,2 @@
+# Editable upstream checkout; OTV modifications are applied separately.
+-e git+https://github.com/hiyouga/LlamaFactory.git@95ac3f2373b82662c1bd855c284d3379e6a763d3#egg=llamafactory

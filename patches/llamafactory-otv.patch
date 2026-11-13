@@ -1,0 +1,993 @@
+--- a/src/llamafactory/model/adapter.py
++++ b/src/llamafactory/model/adapter.py
+@@ -12,11 +12,15 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++import json
++import os
+ import re
+ from typing import TYPE_CHECKING
+ 
+ import torch
++import torch.nn as nn
+ from peft import LoraConfig, LoraModel, OFTConfig, PeftModel, TaskType, get_peft_model
++from safetensors import safe_open
+ from transformers.integrations import is_deepspeed_zero3_enabled
+ 
+ from ..extras import logging
+@@ -35,6 +39,201 @@
+ 
+ 
+ logger = logging.get_logger(__name__)
++
++OTV_ENABLE_ENV = "OTV_ENABLE"
++OTV_REGRESSION_FILENAME = "reg_model.safetensors"
++OTV_REGRESSION_CONFIG_FILENAME = "reg_model_config.json"
++OTV_REG_HIDDEN_DIMS_ENV = "OTV_REG_HIDDEN_DIMS"
++OTV_REG_DROPOUT_ENV = "OTV_REG_DROPOUT"
++
++
++class SequenceRegressionHead(nn.Module):
++    def __init__(
++        self,
++        input_dim: int,
++        hidden_dims: list[int] | tuple[int, ...] | int = (1024, 256),
++        dropout: float = 0.2,
++    ) -> None:
++        super().__init__()
++        if isinstance(hidden_dims, int):
++            hidden_dims = [hidden_dims, 256]
++        hidden_dims = [int(dim) for dim in hidden_dims if int(dim) > 0]
++        if not hidden_dims:
++            raise ValueError("SequenceRegressionHead requires at least one hidden dimension.")
++
++        self.input_dim = int(input_dim)
++        self.hidden_dims = hidden_dims
++        self.dropout = float(dropout)
++
++        dims = [self.input_dim] + self.hidden_dims
++        self.layers = nn.ModuleList(
++            [nn.Linear(dims[idx], dims[idx + 1]) for idx in range(len(dims) - 1)]
++        )
++        self.dropouts = nn.ModuleList([nn.Dropout(self.dropout) for _ in self.hidden_dims])
++        self.activation = nn.ReLU()
++        self.output_layer = nn.Linear(self.hidden_dims[-1], 1)
++        self.sigmoid = nn.Sigmoid()
++
++    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
++        hidden_states = hidden_states.to(self.layers[0].weight.dtype)
++        for layer, dropout in zip(self.layers, self.dropouts):
++            hidden_states = layer(hidden_states)
++            hidden_states = self.activation(hidden_states)
++            hidden_states = dropout(hidden_states)
++
++        hidden_states = self.output_layer(hidden_states)
++        return self.sigmoid(hidden_states)
++
++    def to_config(self) -> dict[str, object]:
++        return {
++            "input_dim": self.input_dim,
++            "hidden_dims": list(self.hidden_dims),
++            "dropout": self.dropout,
++        }
++
++
++def _parse_hidden_dims(raw_value: str | list[int] | tuple[int, ...] | None) -> list[int]:
++    if raw_value is None:
++        return [1024, 256]
++    if isinstance(raw_value, str) and not raw_value.strip():
++        return [1024, 256]
++    if isinstance(raw_value, (list, tuple)):
++        dims = [int(item) for item in raw_value if int(item) > 0]
++    else:
++        dims = [int(item.strip()) for item in str(raw_value).split(",") if item.strip()]
++    if not dims:
++        raise ValueError(f"Invalid regression hidden dims: {raw_value}")
++    return dims
++
++
++def _regression_config_path_from_regression_path(regression_path: str | None) -> str | None:
++    if regression_path is None:
++        return None
++    return os.path.join(os.path.dirname(regression_path), OTV_REGRESSION_CONFIG_FILENAME)
++
++
++def _load_regression_head_config(input_dim: int, regression_path: str | None = None) -> dict[str, object]:
++    config_path = _regression_config_path_from_regression_path(regression_path)
++    if config_path is not None and os.path.isfile(config_path):
++        with open(config_path, "r", encoding="utf-8") as handle:
++            payload = json.load(handle)
++        return {
++            "input_dim": int(payload.get("input_dim", input_dim)),
++            "hidden_dims": _parse_hidden_dims(payload.get("hidden_dims", [1024, 256])),
++            "dropout": float(payload.get("dropout", 0.2)),
++        }
++
++    raw_dropout = os.getenv(OTV_REG_DROPOUT_ENV)
++    if raw_dropout is None or not raw_dropout.strip():
++        raw_dropout = "0.2"
++    return {
++        "input_dim": int(input_dim),
++        "hidden_dims": _parse_hidden_dims(os.getenv(OTV_REG_HIDDEN_DIMS_ENV)),
++        "dropout": float(raw_dropout),
++    }
++
++
++def _build_regression_head(input_dim: int, regression_path: str | None = None) -> SequenceRegressionHead:
++    config = _load_regression_head_config(input_dim=input_dim, regression_path=regression_path)
++    return SequenceRegressionHead(
++        input_dim=int(config["input_dim"]),
++        hidden_dims=config["hidden_dims"],
++        dropout=float(config["dropout"]),
++    )
++
++
++def _regression_head_matches(model: "PreTrainedModel", regression_path: str | None = None) -> bool:
++    if not hasattr(model, "regression_head") or not isinstance(model.regression_head, SequenceRegressionHead):
++        return False
++    config = _load_regression_head_config(input_dim=_get_hidden_size(model.config), regression_path=regression_path)
++    return (
++        int(config["input_dim"]) == model.regression_head.input_dim
++        and list(config["hidden_dims"]) == list(model.regression_head.hidden_dims)
++        and abs(float(config["dropout"]) - float(model.regression_head.dropout)) < 1e-8
++    )
++
++
++def _is_truthy_env(value: str | None) -> bool:
++    if value is None:
++        return False
++    return value.strip().lower() in {"1", "true", "yes", "on"}
++
++
++def _normalize_adapter_paths(adapter_name_or_path):
++    if adapter_name_or_path is None:
++        return []
++    if isinstance(adapter_name_or_path, str):
++        return [item.strip() for item in adapter_name_or_path.split(",") if item.strip()]
++    return [item for item in adapter_name_or_path if item]
++
++
++def _find_otv_regression_path(adapter_name_or_path) -> str | None:
++    for adapter_path in reversed(_normalize_adapter_paths(adapter_name_or_path)):
++        regression_path = os.path.join(adapter_path, OTV_REGRESSION_FILENAME)
++        if os.path.isfile(regression_path):
++            return regression_path
++    return None
++
++
++def _get_hidden_size(config: "PretrainedConfig") -> int:
++    hidden_size = getattr(config, "hidden_size", None)
++    if hidden_size is None and hasattr(config, "text_config"):
++        hidden_size = getattr(config.text_config, "hidden_size", None)
++
++    if hidden_size is None:
++        raise ValueError("Cannot infer hidden size for OTV regression head.")
++
++    return hidden_size
++
++
++def _get_first_attention_module(model: "PreTrainedModel") -> nn.Module:
++    backbone = getattr(model, "base_model", None)
++    backbone = getattr(backbone, "model", model)
++    transformer = getattr(backbone, "model", backbone)
++    layers = getattr(transformer, "layers", None)
++    if not layers:
++        raise ValueError("Cannot locate transformer layers for OTV attention override.")
++
++    return layers[0].self_attn
++
++
++def _load_regression_head(model: "PreTrainedModel", regression_path: str) -> None:
++    state_dict = {}
++    with safe_open(regression_path, framework="pt", device="cpu") as handle:
++        for key in handle.keys():
++            state_dict[key] = handle.get_tensor(key)
++
++    if all(key.startswith("regression_head.") for key in state_dict):
++        state_dict = {key.replace("regression_head.", "", 1): value for key, value in state_dict.items()}
++
++    missing_keys, unexpected_keys = model.regression_head.load_state_dict(state_dict, strict=False)
++    if missing_keys or unexpected_keys:
++        logger.warning_rank0(
++            "Loaded OTV regression head with missing keys {} and unexpected keys {}.".format(
++                list(missing_keys), list(unexpected_keys)
++            )
++        )
++
++
++def _attach_otv_modules(model: "PreTrainedModel", regression_path: str | None = None) -> "PreTrainedModel":
++    if not hasattr(model, "regression_head") or not _regression_head_matches(model, regression_path):
++        model.regression_head = _build_regression_head(
++            input_dim=_get_hidden_size(model.config),
++            regression_path=regression_path,
++        )
++
++    if not hasattr(model, "origin_forward"):
++        model.origin_forward = type(_get_first_attention_module(model)).forward
++
++    if regression_path is not None:
++        logger.info_rank0(f"Loading OTV regression head from {regression_path}.")
++        _load_regression_head(model, regression_path)
++
++    return model
++
++
++def _should_enable_otv(model_args: "ModelArguments") -> bool:
++    return _is_truthy_env(os.getenv(OTV_ENABLE_ENV)) or _find_otv_regression_path(model_args.adapter_name_or_path) is not None
+ 
+ 
+ def _setup_full_tuning(
+@@ -66,7 +265,7 @@
+         return
+ 
+     logger.info_rank0("Fine-tuning method: Freeze")
+-    if hasattr(model.config, "text_config"):  # composite models
++    if hasattr(model.config, "text_config"):
+         config = getattr(model.config, "text_config")
+     else:
+         config = model.config
+@@ -88,9 +287,9 @@
+ 
+         stride = num_layers // finetuning_args.freeze_trainable_layers
+         trainable_layer_ids = range(stride - 1, num_layers + stride - 1, stride)
+-    elif finetuning_args.freeze_trainable_layers > 0:  # fine-tuning the last n layers if num_layer_trainable > 0
++    elif finetuning_args.freeze_trainable_layers > 0:
+         trainable_layer_ids = range(max(0, num_layers - finetuning_args.freeze_trainable_layers), num_layers)
+-    else:  # fine-tuning the first n layers if num_layer_trainable < 0
++    else:
+         trainable_layer_ids = range(min(-finetuning_args.freeze_trainable_layers, num_layers))
+ 
+     hidden_modules = set()
+@@ -98,18 +297,16 @@
+     for name, _ in model.named_parameters():
+         if ".0." in name:
+             hidden_modules.add(name.split(".0.")[-1].split(".")[0])
+-        elif ".1." in name:  # MoD starts from layer 1
++        elif ".1." in name:
+             hidden_modules.add(name.split(".1.")[-1].split(".")[0])
+ 
+         if re.search(r"\.\d+\.", name) is None:
+-            non_hidden_modules.add(name.split(".")[-2])  # remove weight/bias
++            non_hidden_modules.add(name.split(".")[-2])
+ 
+     trainable_layers = []
+     for module_name in finetuning_args.freeze_trainable_modules:
+         if module_name != "all" and module_name not in hidden_modules:
+-            raise ValueError(
+-                "Module {} is not found, please choose from {}".format(module_name, ", ".join(hidden_modules))
+-            )
++            raise ValueError("Module {} is not found, please choose from {}".format(module_name, ", ".join(hidden_modules)))
+ 
+         for idx in trainable_layer_ids:
+             trainable_layers.append(".{:d}.{}".format(idx, module_name if module_name != "all" else ""))
+@@ -158,7 +355,7 @@
+ 
+     if model_args.adapter_name_or_path is not None:
+         is_mergeable = True
+-        if getattr(model, "quantization_method", None):  # merge lora in quantized model is unstable
++        if getattr(model, "quantization_method", None):
+             assert len(model_args.adapter_name_or_path) == 1, "Quantized model only accepts a single adapter."
+             is_mergeable = False
+ 
+@@ -195,13 +392,13 @@
+                 )
+ 
+         for adapter in adapter_to_merge:
+-            model: LoraModel = PeftModel.from_pretrained(model, adapter, **init_kwargs)
++            model = PeftModel.from_pretrained(model, adapter, **init_kwargs)
+             model = model.merge_and_unload()
+ 
+         if len(adapter_to_merge) > 0:
+             logger.info_rank0(f"Merged {len(adapter_to_merge)} adapter(s).")
+ 
+-        if adapter_to_resume is not None:  # resume lora training
++        if adapter_to_resume is not None:
+             if model_args.use_kt:
+                 model = load_kt_peft_model(model_args, model)
+             elif model_args.use_unsloth:
+@@ -211,7 +408,7 @@
+ 
+         logger.info_rank0("Loaded adapter(s): {}".format(",".join(model_args.adapter_name_or_path)))
+ 
+-    if is_trainable and adapter_to_resume is None:  # create new lora weights while training
++    if is_trainable and adapter_to_resume is None:
+         if len(finetuning_args.lora_target) == 1 and finetuning_args.lora_target[0] == "all":
+             target_modules = find_all_linear_modules(model, finetuning_args.freeze_vision_tower)
+         else:
+@@ -219,11 +416,11 @@
+ 
+         if model_args.use_kt:
+             new_list = []
+-            for m in target_modules:
+-                if m in ("down_proj", "up_proj", "gate_proj"):
+-                    new_list.extend([f"mlp.{m}", f"shared_experts.{m}"])
+-                elif m not in ("generate_linear", "orig_module", "prefill_linear"):
+-                    new_list.append(m)
++            for module_name in target_modules:
++                if module_name in ("down_proj", "up_proj", "gate_proj"):
++                    new_list.extend([f"mlp.{module_name}", f"shared_experts.{module_name}"])
++                elif module_name not in ("generate_linear", "orig_module", "prefill_linear"):
++                    new_list.append(module_name)
+ 
+             target_modules[:] = new_list
+ 
+@@ -240,15 +437,19 @@
+             raise ValueError("DoRA is not compatible with PTQ-quantized models.")
+ 
+         if model_args.resize_vocab and finetuning_args.additional_target is None:
+-            input_embeddings = model.get_input_embeddings()
+-            output_embeddings = model.get_output_embeddings()
+-            module_names = set()
+-            for name, module in model.named_modules():
+-                if module in [input_embeddings, output_embeddings]:
+-                    module_names.add(name.split(".")[-1])
+-
+-            finetuning_args.additional_target = module_names
+-            logger.warning_rank0("Vocab has been resized, add {} to trainable params.".format(",".join(module_names)))
++            freeze_resized_vocab = _is_truthy_env(os.getenv("OTV_FREEZE_RESIZED_VOCAB", ""))
++            if freeze_resized_vocab and _should_enable_otv(model_args):
++                logger.warning_rank0("Vocab has been resized, but keep embed_tokens/lm_head frozen for OTV.")
++            else:
++                input_embeddings = model.get_input_embeddings()
++                output_embeddings = model.get_output_embeddings()
++                module_names = set()
++                for name, module in model.named_modules():
++                    if module in [input_embeddings, output_embeddings]:
++                        module_names.add(name.split(".")[-1])
++
++                finetuning_args.additional_target = module_names
++                logger.warning_rank0("Vocab has been resized, add {} to trainable params.".format(",".join(module_names)))
+ 
+         if finetuning_args.finetuning_type == "lora":
+             peft_kwargs = {
+@@ -273,11 +474,7 @@
+             if finetuning_args.finetuning_type == "oft":
+                 raise ValueError("KTransformers is currently not supported for OFT.")
+             if finetuning_args.finetuning_type == "lora":
+-                peft_config = LoraConfig(
+-                    task_type=TaskType.CAUSAL_LM,
+-                    inference_mode=False,
+-                    **peft_kwargs,
+-                )
++                peft_config = LoraConfig(task_type=TaskType.CAUSAL_LM, inference_mode=False, **peft_kwargs)
+             else:
+                 raise ValueError("KTransformers is currently only supported for LoRA.")
+ 
+@@ -298,21 +495,17 @@
+                     peft_kwargs["init_lora_weights"] = f"pissa_niter_{finetuning_args.pissa_iter}"
+ 
+             if finetuning_args.finetuning_type == "lora":
+-                peft_config = LoraConfig(
+-                    task_type=TaskType.CAUSAL_LM,
+-                    inference_mode=False,
+-                    **peft_kwargs,
+-                )
++                peft_config = LoraConfig(task_type=TaskType.CAUSAL_LM, inference_mode=False, **peft_kwargs)
+             elif finetuning_args.finetuning_type == "oft":
+-                peft_config = OFTConfig(
+-                    task_type=TaskType.CAUSAL_LM,
+-                    inference_mode=False,
+-                    **peft_kwargs,
+-                )
++                peft_config = OFTConfig(task_type=TaskType.CAUSAL_LM, inference_mode=False, **peft_kwargs)
++
+             model = get_peft_model(model, peft_config)
+ 
++    if _should_enable_otv(model_args):
++        model = _attach_otv_modules(model, _find_otv_regression_path(model_args.adapter_name_or_path))
++
+     if is_trainable and cast_trainable_params_to_fp32:
+-        for param in filter(lambda p: p.requires_grad, model.parameters()):
++        for param in filter(lambda parameter: parameter.requires_grad, model.parameters()):
+             param.data = param.data.to(torch.float32)
+ 
+     return model
+@@ -338,9 +531,6 @@
+         if finetuning_args.pissa_init:
+             raise ValueError("Cannot initialize PiSSA adapter on quantized models.")
+ 
+-    # cast trainable parameters to float32 if:
+-    # 1. is_trainable and not pure_bf16 and not badam and quantization_bit is not None (qlora)
+-    # 2. is_trainable and not pure_bf16 and not badam and not zero3 (zero3 already in fp32)
+     cast_trainable_params_to_fp32 = False
+     if not is_trainable:
+         pass
+@@ -363,4 +553,13 @@
+     else:
+         raise NotImplementedError(f"Unknown finetuning type: {finetuning_args.finetuning_type}.")
+ 
++    if _should_enable_otv(model_args) and not hasattr(model, "regression_head"):
++        model = _attach_otv_modules(model, _find_otv_regression_path(model_args.adapter_name_or_path))
++
++    if _should_enable_otv(model_args) and is_trainable and hasattr(model, "regression_head"):
++        for parameter in model.regression_head.parameters():
++            parameter.requires_grad_(True)
++            if cast_trainable_params_to_fp32:
++                parameter.data = parameter.data.to(torch.float32)
++
+     return model
+--- a/src/llamafactory/train/sft/trainer.py
++++ b/src/llamafactory/train/sft/trainer.py
+@@ -21,8 +21,17 @@
+ from typing import TYPE_CHECKING, Any, Optional, Union
+ 
+ import numpy as np
++import safetensors.torch
+ import torch
++import torch.nn.functional as F
+ from transformers import Seq2SeqTrainer
++from transformers.models.qwen3.modeling_qwen3 import (
++    Cache,
++    FlashAttentionKwargs,
++    Unpack,
++    apply_rotary_pos_emb,
++    repeat_kv,
++)
+ from typing_extensions import override
+ 
+ from ...extras import logging
+@@ -42,6 +51,200 @@
+ 
+ 
+ logger = logging.get_logger(__name__)
++
++OTV_CORRECT_KEY = "otv_correct"
++OTV_TARGET_MODE_ENV = "OTV_TARGET_MODE"
++OTV_VERIFIER_MODE_ENV = "OTV_VERIFIER_MODE"
++OTV_TRUTH_TOKEN = "<token of truth>"
++OTV_REGRESSION_FILENAME = "reg_model.safetensors"
++OTV_REGRESSION_CONFIG_FILENAME = "reg_model_config.json"
++
++
++def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
++    if isinstance(model, torch.nn.parallel.DistributedDataParallel):
++        return model.module
++    return model
++
++
++def _get_first_attention_module(model: torch.nn.Module) -> torch.nn.Module:
++    model = _unwrap_model(model)
++    backbone = getattr(model, "base_model", None)
++    backbone = getattr(backbone, "model", model)
++    transformer = getattr(backbone, "model", backbone)
++    layers = getattr(transformer, "layers", None)
++    if not layers:
++        raise ValueError("Cannot locate transformer layers for OTV attention override.")
++
++    return layers[0].self_attn
++
++
++def _select_verification_forward(model: torch.nn.Module):
++    attention_module = _get_first_attention_module(model)
++    if hasattr(attention_module, "q_norm") and hasattr(attention_module, "k_norm"):
++        return modified_forward_qwen
++    return modified_forward
++
++
++def _find_response_start(labels: torch.Tensor) -> torch.Tensor:
++    target_mask = labels.ne(IGNORE_INDEX)
++    if not torch.all(target_mask.any(dim=-1)):
++        raise ValueError("Each OTV example must contain at least one supervised response token.")
++    return target_mask.long().argmax(dim=-1)
++
++
++def _get_cached_key_values(past_key_values: Cache, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
++    if hasattr(past_key_values, "key_cache") and hasattr(past_key_values, "value_cache"):
++        return past_key_values.key_cache[layer_idx], past_key_values.value_cache[layer_idx]
++
++    if hasattr(past_key_values, "layers"):
++        layer = past_key_values.layers[layer_idx]
++        return layer.keys, layer.values
++
++    raise ValueError("Unsupported cache object for OTV verification.")
++
++
++def modified_forward(
++    self,
++    hidden_states: torch.Tensor,
++    position_embeddings: tuple[torch.Tensor, torch.Tensor],
++    attention_mask: Optional[torch.Tensor],
++    past_key_values: Optional[Cache] = None,
++    cache_position: Optional[torch.LongTensor] = None,
++    **kwargs: Unpack[FlashAttentionKwargs],
++) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
++    input_shape = hidden_states.shape[:-1]
++    hidden_shape = (*input_shape, -1, self.head_dim)
++
++    query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
++    key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
++    value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
++
++    cos, sin = position_embeddings
++    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
++
++    if past_key_values is None:
++        raise ValueError("OTV verification requires `past_key_value`.")
++
++    cached_keys, cached_values = _get_cached_key_values(past_key_values, self.layer_idx)
++    past_k = repeat_kv(cached_keys, self.num_key_value_groups)
++    past_v = repeat_kv(cached_values, self.num_key_value_groups)
++    key_states = repeat_kv(key_states, self.num_key_value_groups)
++    value_states = repeat_kv(value_states, self.num_key_value_groups)
++
++    diag_attn = torch.diag_embed(torch.sum(query_states * key_states, dim=3) * self.scaling)
++    attn_weights = torch.tril(torch.matmul(query_states[:, :, :-1, :], past_k.transpose(2, 3)) * self.scaling)
++    new_attn_weights = torch.zeros(
++        (attn_weights.shape[0], attn_weights.shape[1], attn_weights.shape[2] + 1, attn_weights.shape[3] + 1),
++        dtype=attn_weights.dtype,
++        device=attn_weights.device,
++    )
++    new_attn_weights[:, :, 1:, :-1] = attn_weights
++    new_attn_weights = new_attn_weights + diag_attn
++
++    causal_mask = torch.triu(
++        torch.ones(
++            (new_attn_weights.shape[-2], new_attn_weights.shape[-1]),
++            dtype=torch.bool,
++            device=new_attn_weights.device,
++        ),
++        diagonal=1,
++    )
++    new_attn_weights.masked_fill_(causal_mask, torch.finfo(new_attn_weights.dtype).min)
++
++    new_attn_weights = F.softmax(new_attn_weights, dim=-1, dtype=torch.float32).to(attn_weights.dtype)
++    first_part = torch.cat(
++        [
++            torch.zeros(
++                new_attn_weights.shape[0],
++                new_attn_weights.shape[1],
++                1,
++                self.head_dim,
++                dtype=attn_weights.dtype,
++                device=attn_weights.device,
++            ),
++            torch.matmul(new_attn_weights[:, :, 1:, :-1], past_v),
++        ],
++        dim=2,
++    )
++    second_part = torch.diagonal(new_attn_weights, dim1=-2, dim2=-1).unsqueeze(-1) * value_states
++
++    attn_output = first_part + second_part
++    attn_output = attn_output.transpose(1, 2).contiguous()
++    attn_output = attn_output.reshape(*input_shape, -1).contiguous()
++    attn_output = self.o_proj(attn_output)
++    return attn_output, new_attn_weights
++
++
++def modified_forward_qwen(
++    self,
++    hidden_states: torch.Tensor,
++    position_embeddings: tuple[torch.Tensor, torch.Tensor],
++    attention_mask: Optional[torch.Tensor],
++    past_key_values: Optional[Cache] = None,
++    cache_position: Optional[torch.LongTensor] = None,
++    **kwargs: Unpack[FlashAttentionKwargs],
++) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
++    input_shape = hidden_states.shape[:-1]
++    hidden_shape = (*input_shape, -1, self.head_dim)
++
++    query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
++    key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
++    value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
++
++    cos, sin = position_embeddings
++    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
++
++    if past_key_values is None:
++        raise ValueError("OTV verification requires `past_key_value`.")
++
++    cached_keys, cached_values = _get_cached_key_values(past_key_values, self.layer_idx)
++    past_k = repeat_kv(cached_keys, self.num_key_value_groups)
++    past_v = repeat_kv(cached_values, self.num_key_value_groups)
++    key_states = repeat_kv(key_states, self.num_key_value_groups)
++    value_states = repeat_kv(value_states, self.num_key_value_groups)
++
++    diag_attn = torch.diag_embed(torch.sum(query_states * key_states, dim=3) * self.scaling)
++    attn_weights = torch.tril(torch.matmul(query_states[:, :, :-1, :], past_k.transpose(2, 3)) * self.scaling)
++    new_attn_weights = torch.zeros(
++        (attn_weights.shape[0], attn_weights.shape[1], attn_weights.shape[2] + 1, attn_weights.shape[3] + 1),
++        dtype=attn_weights.dtype,
++        device=attn_weights.device,
++    )
++    new_attn_weights[:, :, 1:, :-1] = attn_weights
++    new_attn_weights = new_attn_weights + diag_attn
++
++    causal_mask = torch.triu(
++        torch.ones(
++            (new_attn_weights.shape[-2], new_attn_weights.shape[-1]),
++            dtype=torch.bool,
++            device=new_attn_weights.device,
++        ),
++        diagonal=1,
++    )
++    new_attn_weights.masked_fill_(causal_mask, torch.finfo(new_attn_weights.dtype).min)
++
++    new_attn_weights = F.softmax(new_attn_weights, dim=-1, dtype=torch.float32).to(attn_weights.dtype)
++    first_part = torch.cat(
++        [
++            torch.zeros(
++                new_attn_weights.shape[0],
++                new_attn_weights.shape[1],
++                1,
++                self.head_dim,
++                dtype=attn_weights.dtype,
++                device=attn_weights.device,
++            ),
++            torch.matmul(new_attn_weights[:, :, 1:, :-1], past_v),
++        ],
++        dim=2,
++    )
++    second_part = torch.diagonal(new_attn_weights, dim1=-2, dim2=-1).unsqueeze(-1) * value_states
++
++    attn_output = first_part + second_part
++    attn_output = attn_output.transpose(1, 2).contiguous()
++    attn_output = attn_output.reshape(*input_shape, -1).contiguous()
++    attn_output = self.o_proj(attn_output)
++    return attn_output, new_attn_weights
+ 
+ 
+ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
+@@ -55,7 +258,6 @@
+         gen_kwargs: Optional[dict[str, Any]] = None,
+         **kwargs,
+     ) -> None:
+-        # Configure FP8 environment if enabled
+         if model_args is not None and model_args.fp8:
+             configure_fp8_environment(model_args)
+         if is_transformers_version_greater_than("4.46"):
+@@ -65,13 +267,10 @@
+ 
+         super().__init__(**kwargs)
+         if processor is not None:
+-            # avoid wrong loss under gradient accumulation
+-            # https://github.com/huggingface/transformers/pull/36044#issuecomment-2746657112
+             self.model_accepts_loss_kwargs = False
+ 
+         self.finetuning_args = finetuning_args
+         if gen_kwargs is not None:
+-            # https://github.com/huggingface/transformers/blob/v4.45.0/src/transformers/trainer_seq2seq.py#L287
+             self._gen_kwargs = gen_kwargs
+ 
+         if processor is not None:
+@@ -88,9 +287,14 @@
+ 
+             self.compute_loss_func = dft_loss_func
+ 
+-        # Verify FP8 status after trainer initialization (accelerator should be available)
+         if model_args is not None and model_args.fp8 and hasattr(self, "accelerator"):
+             verify_fp8_status(self.accelerator, model_args)
++
++    @override
++    def _set_signature_columns_if_needed(self) -> None:
++        super()._set_signature_columns_if_needed()
++        if self._signature_columns is not None and OTV_CORRECT_KEY not in self._signature_columns:
++            self._signature_columns.append(OTV_CORRECT_KEY)
+ 
+     @override
+     def create_optimizer(self) -> "torch.optim.Optimizer":
+@@ -112,9 +316,277 @@
+ 
+         return super()._get_train_sampler(*args, **kwargs)
+ 
++    @staticmethod
++    def extract_answer_number(text: str, prefix: str = "Answer:") -> float | None:
++        import re
++
++        pattern = r".*%s\s*[^0-9]*(\d+)" % (prefix)
++        match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
++        if match:
++            return float(match.group(1))
++        return None
++
++    @staticmethod
++    def custom_mse_loss(
++        regression_output: torch.Tensor,
++        valid_end: torch.Tensor,
++        valid_begin: torch.Tensor,
++        ground_predict: torch.Tensor,
++        decoded_texts: Optional[list[str]] = None,
++        mode: str = "linear",
++    ) -> torch.Tensor:
++        batch_size, seq_len, _ = regression_output.shape
++        device = regression_output.device
++
++        positions = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
++        valid_mask = (positions >= valid_begin.unsqueeze(1)) & (positions <= valid_end.unsqueeze(1))
++        valid_mask = valid_mask.unsqueeze(-1)
++
++        valid_len = torch.clamp(valid_end - valid_begin, min=1).unsqueeze(1).unsqueeze(2)
++        target = torch.full_like(regression_output, 0.5, device=device)
++
++        pos_in_valid = positions - valid_begin.unsqueeze(1)
++        pos_ratio = pos_in_valid.unsqueeze(-1) / valid_len
++        pos_ratio = torch.clamp(pos_ratio, 0.0, 1.0)
++
++        is_correct = ground_predict.long().eq(1).unsqueeze(1).unsqueeze(2)
++        is_incorrect = ~is_correct
++
++        if mode == "constant":
++            target[is_correct & valid_mask] = 1.0
++            target[is_incorrect & valid_mask] = 0.0
++        elif mode == "sigmoid":
++            alpha = 4.0
++            shaped_ratio = 1.0 / (1.0 + torch.exp(-alpha * (pos_ratio - 0.5)))
++            target[is_correct & valid_mask] = 0.5 * (1.0 + shaped_ratio[is_correct & valid_mask])
++            target[is_incorrect & valid_mask] = 0.5 * (1.0 - shaped_ratio[is_incorrect & valid_mask])
++        elif mode == "exponential":
++            beta = 2.0
++            shaped_ratio = torch.pow(beta, pos_ratio) - 1.0
++            shaped_ratio = shaped_ratio / (beta - 1.0)
++            target[is_correct & valid_mask] = 0.5 * (1.0 + shaped_ratio[is_correct & valid_mask])
++            target[is_incorrect & valid_mask] = 0.5 * (1.0 - shaped_ratio[is_incorrect & valid_mask])
++        elif mode == "wave":
++            wave = 0.1 * torch.sin(2 * torch.pi * 3.0 * pos_ratio)
++            shaped_ratio = torch.clamp(pos_ratio + wave, 0.0, 1.0)
++            target[is_correct & valid_mask] = 0.5 * (1.0 + shaped_ratio[is_correct & valid_mask])
++            target[is_incorrect & valid_mask] = 0.5 * (1.0 - shaped_ratio[is_incorrect & valid_mask])
++        elif mode == "step":
++            num_steps = 20
++            shaped_ratio = torch.floor(pos_ratio * num_steps) / max(num_steps - 1, 1)
++            shaped_ratio = torch.clamp(shaped_ratio, 0.0, 1.0)
++            target[is_correct & valid_mask] = 0.5 * (1.0 + shaped_ratio[is_correct & valid_mask])
++            target[is_incorrect & valid_mask] = 0.5 * (1.0 - shaped_ratio[is_incorrect & valid_mask])
++        elif mode == "auto_step" and decoded_texts is not None:
++            for batch_idx in range(batch_size):
++                sample_mask = valid_mask[batch_idx].squeeze(-1)
++                split_points = []
++                cursor = 0
++                while True:
++                    split_idx = decoded_texts[batch_idx].find("\n\n", cursor)
++                    if split_idx == -1:
++                        break
++                    split_points.append(split_idx)
++                    cursor = split_idx + 2
++
++                if not split_points:
++                    shaped_ratio = pos_ratio[batch_idx]
++                else:
++                    text_len = max(len(decoded_texts[batch_idx]), 1)
++                    token_len = max((valid_end[batch_idx] - valid_begin[batch_idx]).item(), 1)
++                    step_positions = [valid_begin[batch_idx].item()]
++                    for split_point in split_points:
++                        token_pos = min(
++                            valid_begin[batch_idx].item() + int(split_point / (text_len / token_len)),
++                            valid_end[batch_idx].item(),
++                        )
++                        step_positions.append(token_pos)
++                    step_positions.append(valid_end[batch_idx].item())
++                    step_positions = sorted(set(step_positions))
++
++                    shaped_ratio = torch.zeros_like(pos_ratio[batch_idx])
++                    for step_idx in range(len(step_positions) - 1):
++                        left = step_positions[step_idx]
++                        right = step_positions[step_idx + 1]
++                        step_mask = (positions[batch_idx] >= left) & (positions[batch_idx] <= right) & sample_mask
++                        if torch.any(step_mask):
++                            denominator = max(len(step_positions) - 2, 1)
++                            shaped_ratio[step_mask, 0] = step_idx / denominator
++
++                if ground_predict[batch_idx].long().item() == 1:
++                    target[batch_idx, sample_mask, 0] = 0.5 * (1.0 + shaped_ratio[sample_mask, 0])
++                else:
++                    target[batch_idx, sample_mask, 0] = 0.5 * (1.0 - shaped_ratio[sample_mask, 0])
++        else:
++            target[is_correct & valid_mask] = 0.5 * (1.0 + pos_ratio[is_correct & valid_mask])
++            target[is_incorrect & valid_mask] = 0.5 * (1.0 - pos_ratio[is_incorrect & valid_mask])
++
++        pred_flat = regression_output[valid_mask].flatten()
++        target_flat = target[valid_mask].flatten()
++        if pred_flat.numel() == 0:
++            return regression_output.new_zeros(())
++
++        return F.mse_loss(pred_flat, target_flat)
++
+     @override
+     def compute_loss(self, model, inputs, *args, **kwargs):
+-        return super().compute_loss(model, inputs, *args, **kwargs)
++        if OTV_CORRECT_KEY not in inputs:
++            return super().compute_loss(model, inputs, *args, **kwargs)
++
++        unwrapped_model = _unwrap_model(model)
++        if not hasattr(unwrapped_model, "regression_head") or not hasattr(unwrapped_model, "origin_forward"):
++            raise ValueError(
++                "OTV batch detected, but the model is missing OTV modules. "
++                "Set OTV_ENABLE=1 when creating the adapter, and add `<token of truth>` as a special token."
++            )
++
++        return_outputs = kwargs.get("return_outputs", False)
++        input_ids = inputs["input_ids"]
++        attention_mask = inputs["attention_mask"]
++        labels = inputs["labels"]
++        otv_correct = inputs[OTV_CORRECT_KEY].to(input_ids.device)
++
++        trace_lengths = attention_mask.sum(dim=-1).long()
++        max_trace_len = int(trace_lengths.max().item())
++        trace_inputs = {
++            "input_ids": input_ids[:, :max_trace_len],
++            "attention_mask": attention_mask[:, :max_trace_len],
++        }
++
++        response_start = _find_response_start(labels[:, :max_trace_len]).long()
++        verifier_mode = os.getenv(OTV_VERIFIER_MODE_ENV, "kv_cache").strip().lower() or "kv_cache"
++        target_mode = os.getenv(OTV_TARGET_MODE_ENV, "linear").strip().lower() or "linear"
++
++        if verifier_mode in {"hidden", "hidden_state", "hidden_states", "probe", "hidden_probe"}:
++            outputs = model(
++                **trace_inputs,
++                use_cache=False,
++                output_hidden_states=True,
++            )
++            regression_output = unwrapped_model.regression_head(outputs.hidden_states[-1])
++            loss = self.custom_mse_loss(
++                regression_output.float(),
++                valid_end=torch.clamp(trace_lengths - 1, min=0),
++                valid_begin=response_start,
++                ground_predict=otv_correct,
++                decoded_texts=None,
++                mode=target_mode,
++            )
++            if return_outputs:
++                return loss, outputs
++            return loss
++        elif verifier_mode not in {"kv", "kv_cache", "otv", "cache"}:
++            raise ValueError(
++                f"Unsupported OTV verifier mode: {verifier_mode}. "
++                "Expected one of kv_cache, otv, hidden_state, or hidden_probe."
++            )
++
++        valid_begin = response_start + 1
++        valid_end = trace_lengths
++
++        tokenizer = self.processing_class
++        truth_token_id = tokenizer.convert_tokens_to_ids(OTV_TRUTH_TOKEN)
++        if truth_token_id is None or truth_token_id < 0 or truth_token_id == getattr(tokenizer, "unk_token_id", -1):
++            raise ValueError(
++                "The OTV truth token is missing from the tokenizer. "
++                "Launch training with `add_special_tokens: <token of truth>` and `resize_vocab: true`."
++            )
++
++        attention_cls = type(_get_first_attention_module(model))
++        origin_forward = unwrapped_model.origin_forward
++        verification_forward = _select_verification_forward(model)
++        was_training = model.training
++
++        try:
++            model.eval()
++            with torch.no_grad():
++                with unwrapped_model.disable_adapter():
++                    attention_cls.forward = origin_forward
++                    generation_output = unwrapped_model.generate(
++                        **trace_inputs,
++                        return_dict_in_generate=True,
++                        use_cache=True,
++                        max_new_tokens=1,
++                    )
++
++            if was_training:
++                model.train()
++
++            special_ids = list(getattr(tokenizer, "all_special_ids", []))
++            if not special_ids and tokenizer.pad_token_id is not None:
++                special_ids = [tokenizer.pad_token_id]
++
++            special_ids_tensor = torch.tensor(special_ids, device=generation_output.sequences.device)
++            if special_ids:
++                special_mask = torch.isin(generation_output.sequences, special_ids_tensor)
++                new_attention_mask = (~special_mask).to(generation_output.sequences.dtype)
++            else:
++                new_attention_mask = torch.ones_like(generation_output.sequences)
++
++            new_ids = torch.full_like(generation_output.sequences, truth_token_id)
++            attention_cls.forward = verification_forward
++            backbone_model = getattr(getattr(unwrapped_model, "model", None), "model", None)
++            if backbone_model is None:
++                raise ValueError("OTV verifier backbone is missing the base Qwen3Model.")
++            outputs = backbone_model(
++                input_ids=new_ids,
++                attention_mask=new_attention_mask,
++                past_key_values=generation_output.past_key_values,
++                use_cache=True,
++                output_hidden_states=False,
++                return_dict=True,
++            )
++            regression_output = unwrapped_model.regression_head(outputs.last_hidden_state)
++
++            decoded_texts = None
++            if target_mode == "auto_step":
++                decoded_texts = tokenizer.batch_decode(generation_output.sequences, skip_special_tokens=True)
++
++            loss = self.custom_mse_loss(
++                regression_output.float(),
++                valid_end=valid_end,
++                valid_begin=valid_begin,
++                ground_predict=otv_correct,
++                decoded_texts=decoded_texts,
++                mode=target_mode,
++            )
++        finally:
++            attention_cls.forward = origin_forward
++            if was_training:
++                model.train()
++            else:
++                model.eval()
++
++        if return_outputs:
++            return loss, outputs
++        return loss
++
++    @override
++    def _save(self, output_dir: Optional[str] = None, state_dict=None):
++        super()._save(output_dir=output_dir, state_dict=state_dict)
++
++        output_dir = output_dir if output_dir is not None else self.args.output_dir
++        if not self.is_world_process_zero():
++            return
++
++        model = self.accelerator.unwrap_model(self.model, keep_torch_compile=False)
++        if not hasattr(model, "regression_head"):
++            return
++
++        regression_state = {
++            f"regression_head.{name}": tensor.detach().cpu()
++            for name, tensor in model.regression_head.state_dict().items()
++        }
++        safetensors.torch.save_file(
++            regression_state,
++            os.path.join(output_dir, OTV_REGRESSION_FILENAME),
++            metadata={"format": "pt"},
++        )
++
++        if hasattr(model.regression_head, "to_config"):
++            config_path = os.path.join(output_dir, OTV_REGRESSION_CONFIG_FILENAME)
++            with open(config_path, "w", encoding="utf-8") as handle:
++                json.dump(model.regression_head.to_config(), handle, ensure_ascii=False, indent=2)
+ 
+     @override
+     def prediction_step(
+@@ -125,11 +597,7 @@
+         ignore_keys: Optional[list[str]] = None,
+         **gen_kwargs,
+     ) -> tuple[Optional[float], Optional["torch.Tensor"], Optional["torch.Tensor"]]:
+-        r"""Remove the prompt part in the generated tokens.
+-
+-        Subclass and override to inject custom behavior.
+-        """
+-        if self.args.predict_with_generate:  # do not pass labels to model when generate
++        if self.args.predict_with_generate:
+             labels = inputs.pop("labels", None)
+         else:
+             labels = inputs.get("labels")
+@@ -146,10 +614,6 @@
+     def save_predictions(
+         self, dataset: "Dataset", predict_results: "PredictionOutput", skip_special_tokens: bool = True
+     ) -> None:
+-        r"""Save model predictions to `output_dir`.
+-
+-        A custom behavior that not contained in Seq2SeqTrainer.
+-        """
+         if not self.is_world_process_zero():
+             return
+ 
+@@ -165,15 +629,15 @@
+             self.processing_class.pad_token_id,
+         )
+ 
+-        for i in range(len(preds)):
+-            pad_len = np.nonzero(preds[i] != self.processing_class.pad_token_id)[0]
+-            if len(pad_len):  # move pad token to last
+-                preds[i] = np.concatenate((preds[i][pad_len[0] :], preds[i][: pad_len[0]]), axis=-1)
++        for idx in range(len(preds)):
++            pad_len = np.nonzero(preds[idx] != self.processing_class.pad_token_id)[0]
++            if len(pad_len):
++                preds[idx] = np.concatenate((preds[idx][pad_len[0] :], preds[idx][: pad_len[0]]), axis=-1)
+ 
+         decoded_inputs = self.processing_class.batch_decode(dataset["input_ids"], skip_special_tokens=False)
+         decoded_preds = self.processing_class.batch_decode(preds, skip_special_tokens=skip_special_tokens)
+         decoded_labels = self.processing_class.batch_decode(labels, skip_special_tokens=skip_special_tokens)
+ 
+-        with open(output_prediction_file, "w", encoding="utf-8") as f:
++        with open(output_prediction_file, "w", encoding="utf-8") as handle:
+             for text, pred, label in zip(decoded_inputs, decoded_preds, decoded_labels):
+-                f.write(json.dumps({"prompt": text, "predict": pred, "label": label}, ensure_ascii=False) + "\n")
++                handle.write(json.dumps({"prompt": text, "predict": pred, "label": label}, ensure_ascii=False) + "\n")
