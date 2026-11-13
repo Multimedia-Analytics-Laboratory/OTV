@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "otv-verifier"
+version = "0.1.0"
+description = "One-Token Verification for Reasoning Correctness Estimation"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "torch>=2.6,<3",
+  "transformers==4.57.1",
+  "peft==0.17.1",
+  "safetensors>=0.5,<1",
+]
+
+[project.optional-dependencies]
+notebook = ["jupyterlab>=4,<5", "ipykernel>=6,<7"]
+test = ["pytest>=8,<9", "nbformat>=5,<6", "nbclient>=0.10,<1", "ipykernel>=6,<7"]
+
+[project.scripts]
+otv-train = "otv.train:main"
+otv-score = "otv.score:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
